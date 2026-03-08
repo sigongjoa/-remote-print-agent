@@ -1,0 +1,6 @@
+.env
+__pycache__/
+*.pyc
+*.log
+executor/executor.log
+report/report.pdf
