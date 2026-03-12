@@ -23,6 +23,19 @@ from PIL import Image, ImageDraw
 import pystray
 from pystray import MenuItem as item
 
+# Google Drive API 연동
+try:
+    from google.oauth2.credentials import Credentials
+    from google.auth.transport.requests import Request
+    from googleapiclient.discovery import build
+    from googleapiclient.http import MediaIoBaseDownload
+    HAS_GDRIVE = True
+except ImportError:
+    HAS_GDRIVE = False
+
+GDRIVE_TOKEN_PATH = Path.home() / '.config/gws/drive_token.json'
+GDRIVE_SCOPES = ['https://www.googleapis.com/auth/drive']
+
 # 로깅 설정
 log_path = BASE_DIR / "executor.log"
 logging.basicConfig(
@@ -169,6 +182,77 @@ class PrintAgentTray:
                 pass
         log.info(f"[알림] {title}: {message}")
 
+    def _get_gdrive_service(self):
+        """Google Drive API 서비스 객체 반환"""
+        if not HAS_GDRIVE:
+            return None
+        if not GDRIVE_TOKEN_PATH.exists():
+            return None
+        creds = Credentials.from_authorized_user_file(str(GDRIVE_TOKEN_PATH), GDRIVE_SCOPES)
+        if creds and creds.expired and creds.refresh_token:
+            creds.refresh(Request())
+            GDRIVE_TOKEN_PATH.write_text(creds.to_json())
+        return build('drive', 'v3', credentials=creds)
+
+    def _resolve_folder_id(self, svc, folder_path: str, parent_id: str = 'root') -> str:
+        """폴더 경로를 Drive 폴더 ID로 변환"""
+        parts = [p.strip() for p in folder_path.replace('\\', '/').split('/') if p.strip()]
+        current_id = parent_id
+        for part in parts:
+            q = f"'{current_id}' in parents and name='{part}' and mimeType='application/vnd.google-apps.folder' and trashed=false"
+            res = svc.files().list(q=q, fields='files(id,name)').execute()
+            files = res.get('files', [])
+            if not files:
+                return None
+            current_id = files[0]['id']
+        return current_id
+
+    def _download_from_gdrive(self, drive_path: str, local_path: str) -> bool:
+        """Google Drive에서 파일 다운로드"""
+        svc = self._get_gdrive_service()
+        if not svc:
+            return False
+
+        drive_path = drive_path.replace('\\', '/')
+        parts = [p for p in drive_path.split('/') if p]
+        if len(parts) < 1:
+            return False
+
+        file_name = parts[-1]
+        folder_path = '/'.join(parts[:-1]) if len(parts) > 1 else ''
+
+        try:
+            if folder_path:
+                folder_id = self._resolve_folder_id(svc, folder_path)
+                if not folder_id:
+                    log.error(f"  Drive 폴더를 찾을 수 없음: {folder_path}")
+                    return False
+            else:
+                folder_id = 'root'
+
+            q = f"'{folder_id}' in parents and name='{file_name}' and trashed=false"
+            res = svc.files().list(q=q, fields='files(id,name)').execute()
+            files = res.get('files', [])
+            if not files:
+                log.error(f"  Drive에서 파일을 찾을 수 없음: {file_name}")
+                return False
+
+            file_id = files[0]['id']
+            Path(local_path).parent.mkdir(parents=True, exist_ok=True)
+
+            request = svc.files().get_media(fileId=file_id)
+            with open(local_path, 'wb') as fh:
+                downloader = MediaIoBaseDownload(fh, request)
+                done = False
+                while not done:
+                    _, done = downloader.next_chunk()
+
+            log.info(f"  Drive에서 다운로드 완료: {file_name}")
+            return True
+        except Exception as e:
+            log.error(f"  Drive 다운로드 실패: {e}")
+            return False
+
     def _run_once(self):
         """한 번 폴링 실행"""
         if self.polling:
@@ -201,20 +285,21 @@ class PrintAgentTray:
 
                 set_status(page_id, "Printing")
 
-                # 파일 경로 확인
-                drive_path = job["drive_path"].lstrip("/")
+                # 파일 경로 확인 (경로 구분자 통일)
+                drive_path = job["drive_path"].replace('/', os.sep).replace('\\', os.sep).lstrip(os.sep)
                 local_path = os.path.join(DRIVE_SYNC_PATH, drive_path)
 
-                # 파일 대기 (최대 5분)
-                file_found = False
-                for attempt in range(10):
-                    if os.path.isfile(local_path):
-                        file_found = True
-                        break
-                    log.info(f"  파일 대기 중... ({attempt + 1}/10): {local_path}")
-                    time.sleep(30)
+                # 파일이 로컬에 없으면 Google Drive에서 다운로드
+                if not os.path.isfile(local_path):
+                    log.info(f"  로컬에 파일 없음, Drive에서 다운로드 시도...")
+                    if not self._download_from_gdrive(job["drive_path"], local_path):
+                        err = f"파일을 찾을 수 없음: {local_path}"
+                        log.error(err)
+                        set_status(page_id, "Failed", err)
+                        self._notify("출력 실패", f"{file_name}: 파일 없음")
+                        continue
 
-                if not file_found:
+                if not os.path.isfile(local_path):
                     err = f"파일을 찾을 수 없음: {local_path}"
                     log.error(err)
                     set_status(page_id, "Failed", err)

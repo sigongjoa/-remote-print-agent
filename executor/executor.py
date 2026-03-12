@@ -12,6 +12,7 @@ import logging
 import os
 import sys
 import time
+from pathlib import Path
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from notion_poller import get_pending_jobs, set_status
@@ -19,6 +20,19 @@ from print_handler import send_to_printer
 from spooler_check import wait_for_spooler
 from notifier import send_failure_alert
 from shared.config import DRIVE_SYNC_PATH, POLL_INTERVAL
+
+# Google Drive API 연동
+try:
+    from google.oauth2.credentials import Credentials
+    from google.auth.transport.requests import Request
+    from googleapiclient.discovery import build
+    from googleapiclient.http import MediaIoBaseDownload
+    HAS_GDRIVE = True
+except ImportError:
+    HAS_GDRIVE = False
+
+GDRIVE_TOKEN_PATH = Path.home() / '.config/gws/drive_token.json'
+GDRIVE_SCOPES = ['https://www.googleapis.com/auth/drive']
 
 logging.basicConfig(
     level=logging.INFO,
@@ -31,9 +45,90 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 
+def get_gdrive_service():
+    """Google Drive API 서비스 객체 반환"""
+    if not HAS_GDRIVE:
+        return None
+    if not GDRIVE_TOKEN_PATH.exists():
+        log.warning("Google Drive 토큰 없음 - gdrive_tool.py로 먼저 인증 필요")
+        return None
+    creds = Credentials.from_authorized_user_file(str(GDRIVE_TOKEN_PATH), GDRIVE_SCOPES)
+    if creds and creds.expired and creds.refresh_token:
+        creds.refresh(Request())
+        GDRIVE_TOKEN_PATH.write_text(creds.to_json())
+    return build('drive', 'v3', credentials=creds)
+
+
+def resolve_folder_id(svc, folder_path: str, parent_id: str = 'root') -> str:
+    """폴더 경로를 Drive 폴더 ID로 변환 (예: '학생 교제/서재용/범주론')"""
+    parts = [p.strip() for p in folder_path.replace('\\', '/').split('/') if p.strip()]
+    current_id = parent_id
+    for part in parts:
+        q = f"'{current_id}' in parents and name='{part}' and mimeType='application/vnd.google-apps.folder' and trashed=false"
+        res = svc.files().list(q=q, fields='files(id,name)').execute()
+        files = res.get('files', [])
+        if not files:
+            return None
+        current_id = files[0]['id']
+    return current_id
+
+
+def download_from_gdrive(drive_path: str, local_path: str) -> bool:
+    """Google Drive에서 파일 다운로드"""
+    svc = get_gdrive_service()
+    if not svc:
+        return False
+
+    # 경로 정규화: 슬래시로 통일
+    drive_path = drive_path.replace('\\', '/')
+    parts = [p for p in drive_path.split('/') if p]
+    if len(parts) < 1:
+        return False
+
+    file_name = parts[-1]
+    folder_path = '/'.join(parts[:-1]) if len(parts) > 1 else ''
+
+    try:
+        # 폴더 ID 찾기
+        if folder_path:
+            folder_id = resolve_folder_id(svc, folder_path)
+            if not folder_id:
+                log.error(f"  Drive 폴더를 찾을 수 없음: {folder_path}")
+                return False
+        else:
+            folder_id = 'root'
+
+        # 파일 찾기
+        q = f"'{folder_id}' in parents and name='{file_name}' and trashed=false"
+        res = svc.files().list(q=q, fields='files(id,name)').execute()
+        files = res.get('files', [])
+        if not files:
+            log.error(f"  Drive에서 파일을 찾을 수 없음: {file_name}")
+            return False
+
+        file_id = files[0]['id']
+
+        # 로컬 폴더 생성
+        Path(local_path).parent.mkdir(parents=True, exist_ok=True)
+
+        # 다운로드
+        request = svc.files().get_media(fileId=file_id)
+        with open(local_path, 'wb') as fh:
+            downloader = MediaIoBaseDownload(fh, request)
+            done = False
+            while not done:
+                _, done = downloader.next_chunk()
+
+        log.info(f"  Drive에서 다운로드 완료: {file_name}")
+        return True
+    except Exception as e:
+        log.error(f"  Drive 다운로드 실패: {e}")
+        return False
+
+
 def resolve_local_path(drive_path: str) -> str:
-    """drive_path를 로컬 Google Drive 동기화 경로로 변환한다."""
-    rel = drive_path.lstrip("/")
+    """drive_path를 로컬 경로로 변환 (경로 구분자 통일)"""
+    rel = drive_path.replace('/', os.sep).replace('\\', os.sep).lstrip(os.sep)
     return os.path.join(DRIVE_SYNC_PATH, rel)
 
 
@@ -46,13 +141,18 @@ def process_job(job: dict) -> None:
 
     local_path = resolve_local_path(job["drive_path"])
 
-    # 파일이 동기화될 때까지 최대 5분 대기
-    for attempt in range(10):
-        if os.path.isfile(local_path):
-            break
-        log.info(f"  파일 대기 중... ({attempt + 1}/10): {local_path}")
-        time.sleep(30)
-    else:
+    # 파일이 로컬에 없으면 Google Drive에서 다운로드
+    if not os.path.isfile(local_path):
+        log.info(f"  로컬에 파일 없음, Drive에서 다운로드 시도...")
+        if not download_from_gdrive(job["drive_path"], local_path):
+            err = f"파일을 찾을 수 없음: {local_path}"
+            log.error(err)
+            set_status(page_id, "Failed", err)
+            send_failure_alert(file_name, err, job["notion_url"])
+            return
+
+    # 파일 존재 확인
+    if not os.path.isfile(local_path):
         err = f"파일을 찾을 수 없음: {local_path}"
         log.error(err)
         set_status(page_id, "Failed", err)
