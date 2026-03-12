@@ -18,7 +18,6 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from notion_poller import get_pending_jobs, set_status
 from print_handler import send_to_printer
 from spooler_check import wait_for_spooler
-from notifier import send_failure_alert
 from shared.config import DRIVE_SYNC_PATH, POLL_INTERVAL
 
 # Google Drive API 연동
@@ -156,7 +155,6 @@ def process_job(job: dict) -> None:
         err = f"파일을 찾을 수 없음: {local_path}"
         log.error(err)
         set_status(page_id, "Failed", err)
-        send_failure_alert(file_name, err, job["notion_url"])
         return
 
     try:
@@ -171,7 +169,6 @@ def process_job(job: dict) -> None:
         err = str(e)
         log.error(f"  출력 실패: {err}")
         set_status(page_id, "Failed", err)
-        send_failure_alert(file_name, err, job["notion_url"])
         return
 
     received = wait_for_spooler(file_name, timeout=30)
@@ -179,7 +176,6 @@ def process_job(job: dict) -> None:
         err = "스풀러 수신 확인 실패 (30초 타임아웃)"
         log.warning(f"  {err}")
         set_status(page_id, "Failed", err)
-        send_failure_alert(file_name, err, job["notion_url"])
         return
 
     set_status(page_id, "Done")
